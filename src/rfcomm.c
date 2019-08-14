@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include "bluealsa.h"
 #include "ctl.h"
@@ -32,6 +34,9 @@ struct at_reader {
 	/* pointer to the next message within the buffer */
 	char *next;
 };
+
+/* RockChip add this code for cooperating with rk deviceio */
+static int rockchip_send_msg_to_deviceiolib(char * buff);
 
 /**
  * Read AT message.
@@ -73,6 +78,13 @@ retry:
 		return -1;
 	}
 
+	if (strstr(at_type2str(reader->at.type), "RESP") && strstr(reader->at.value, "RING"))
+		rockchip_send_msg_to_deviceiolib("hfp_hf_ring");
+	else if (strstr(at_type2str(reader->at.type), "RESP") && strstr(reader->at.command, "+BCS"))
+		rockchip_send_msg_to_deviceiolib(msg);
+	else if (strstr(at_type2str(reader->at.type), "RESP") && strstr(reader->at.command, "+CIEV"))
+		rockchip_send_msg_to_deviceiolib(msg);
+
 	reader->next = tmp[0] != '\0' ? tmp : NULL;
 	return 0;
 }
@@ -105,6 +117,33 @@ retry:
 		return -1;
 	}
 
+	return 0;
+}
+
+static int rockchip_send_msg_to_deviceiolib(char *msg)
+{
+	struct sockaddr_un serverAddr;
+	int snd_cnt = 1;
+	int sockfd;
+	char buff[100] = {0};
+
+	sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if (sockfd < 0) {
+		printf("FUNC:%s create sockfd failed!\n", __func__);
+		return -1;
+	}
+
+	serverAddr.sun_family = AF_UNIX;
+	strcpy(serverAddr.sun_path, "/tmp/rk_deviceio_rfcomm_status");
+	memset(buff, 0, sizeof(buff));
+	sprintf(buff, "rfcomm status:%s;", msg);
+
+	while(snd_cnt--) {
+		sendto(sockfd, buff, strlen(buff), MSG_DONTWAIT, (struct sockaddr *)&serverAddr, sizeof(serverAddr));
+		usleep(1000); //5ms
+	}
+
+	close(sockfd);
 	return 0;
 }
 
@@ -671,6 +710,7 @@ void *rfcomm_thread(void *arg) {
 					break;
 				case HFP_SLC_CMER_SET_OK:
 					rfcomm_set_hfp_state(&conn, HFP_SLC_CONNECTED);
+					rockchip_send_msg_to_deviceiolib("hfp_slc_connected");
 					/* fall-through */
 				case HFP_SLC_CONNECTED:
 					if (t->rfcomm.hfp_features & HFP_AG_FEAT_CODEC)
@@ -680,6 +720,7 @@ void *rfcomm_thread(void *arg) {
 				case HFP_CC_BCS_SET_OK:
 				case HFP_CC_CONNECTED:
 					rfcomm_set_hfp_state(&conn, HFP_CONNECTED);
+					rockchip_send_msg_to_deviceiolib("hfp_hf_connected");
 					/* fall-through */
 				case HFP_CONNECTED:
 					bluealsa_ctl_event(BA_EVENT_TRANSPORT_ADDED);
@@ -835,6 +876,7 @@ ioerror:
 		case ETIMEDOUT:
 			/* exit the thread upon socket disconnection */
 			debug("RFCOMM disconnected: %s", strerror(errno));
+			rockchip_send_msg_to_deviceiolib("hfp_slc_disconnected");
 			goto fail;
 		default:
 			error("RFCOMM IO error: %s", strerror(errno));
