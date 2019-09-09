@@ -138,6 +138,42 @@ fail:
 	return -1;
 }
 
+int hci_submit_cmd_wait(uint16_t ogf, uint16_t ocf, uint8_t *params,
+			uint8_t plen)
+{
+	int fd;
+	uint16_t index = 0;
+	uint8_t status;
+	int ret;
+	struct hci_request rq;
+
+	fd = hci_open_dev(index);
+	if (fd < 0) {
+		error("Couldn't open device: %s(%d)\n", strerror(errno), errno);
+		return -1;
+	}
+
+	memset(&rq, 0, sizeof(rq));
+	rq.ogf = ogf;
+	rq.ocf = ocf;
+	rq.cparam = params;
+	rq.clen = plen;
+	rq.rparam = &status;
+	rq.rlen = 1;
+
+	ret = hci_send_req(fd, &rq, 1000);
+	if (status || ret < 0) {
+		error("Can't send cmd for hci%d: %s (%d)\n", index,
+				strerror(errno), errno);
+		hci_close_dev(fd);
+		return -1;
+	}
+
+	hci_close_dev(fd);
+
+	return 0;
+}
+
 /**
  * Get BlueZ D-Bus object path for given profile and codec.
  *

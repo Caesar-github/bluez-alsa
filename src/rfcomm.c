@@ -417,23 +417,39 @@ static int rfcomm_handler_bcs_set_cb(struct rfcomm_conn *c, const struct bt_at *
 
 static int rfcomm_handler_resp_bcs_ok_cb(struct rfcomm_conn *c, const struct bt_at *at) {
 	struct ba_transport * const t = c->t;
-	struct ba_transport *t_sco;
-	struct bt_voice voice = {
-		.setting = BT_VOICE_CVSD_16BIT,
+
+	/* XXX: this param should be read from rtl8xxx_config */
+	struct pcmif_param {
+		uint8_t pcmifctrl1[2];
+		uint8_t pcmifctrl2[2];
+		uint8_t pcmifctrl3[2];
+		uint8_t pcmconv;
+		uint8_t scoconv;
+		uint8_t hci_ext_codec;
+	} pcmif = {
+		0x83, 0x10,
+		0x00, 0x00,
+		0x12, 0x80,
+		0x00,
+		0x00,
+		0x01
 	};
 
 	if (rfcomm_handler_resp_ok_cb(c, at) != 0)
 		return -1;
 
-	/* Change voice setting according to codec */
-	if (t->rfcomm.sco->codec == HFP_CODEC_MSBC)
-		voice.setting = BT_VOICE_TRANSPARENT;
-	t_sco = t->rfcomm.sco;
-	if (setsockopt(t_sco->sco.listen_fd, SOL_BLUETOOTH, BT_VOICE,
-		       &voice, sizeof(voice)) == -1) {
-		error("setsockopt BT_VOICE error %d, %s", errno,
-		      strerror(errno));
-		return 0;
+	if (t->rfcomm.sco->codec == HFP_CODEC_MSBC) {
+		pcmif.hci_ext_codec = 0x41;
+		pcmif.pcmifctrl3[1] = 0x04;
+	} else if (t->rfcomm.sco->codec == HFP_CODEC_CVSD) {
+		pcmif.hci_ext_codec = 0x01;
+		pcmif.pcmifctrl3[1] = 0x80;
+	}
+
+	if (hci_submit_cmd_wait(0x3f, 0x93, (uint8_t *)&pcmif,
+				sizeof(pcmif)) < 0) {
+		error("Couldn't set controller pcm interface");
+		return -1;
 	}
 
 	/* When codec selection is completed, notify connected clients, that
@@ -451,8 +467,24 @@ static int rfcomm_handler_bcs_resp_cb(struct rfcomm_conn *c, const struct bt_at 
 		AT_TYPE_RESP, "", rfcomm_handler_resp_bcs_ok_cb };
 	struct ba_transport * const t = c->t;
 	const int fd = t->bt_fd;
+	struct ba_transport *t_sco;
+	struct bt_voice voice = {
+		.setting = BT_VOICE_CVSD_16BIT,
+	};
 
 	t->rfcomm.sco->codec = atoi(at->value);
+
+	/* Change voice setting according to codec */
+	if (t->rfcomm.sco->codec == HFP_CODEC_MSBC)
+		voice.setting = 0x0063;
+	t_sco = t->rfcomm.sco;
+	if (setsockopt(t_sco->sco.listen_fd, SOL_BLUETOOTH, BT_VOICE,
+			   &voice, sizeof(voice)) == -1) {
+		error("setsockopt BT_VOICE error %d, %s", errno,
+			  strerror(errno));
+		return 0;
+	}
+
 	if (rfcomm_write_at(fd, AT_TYPE_CMD_SET, "+BCS", at->value) == -1)
 		return -1;
 
@@ -679,7 +711,7 @@ void *rfcomm_thread(void *arg) {
 				case HFP_SLC_BRSF_SET_OK:
 					if (t->rfcomm.hfp_features & HFP_AG_FEAT_CODEC) {
 						/* XXX: If mSBC is supported, please change 1 to 1,2 */
-						if (rfcomm_write_at(pfds[1].fd, AT_TYPE_CMD_SET, "+BAC", "1") == -1)
+						if (rfcomm_write_at(pfds[1].fd, AT_TYPE_CMD_SET, "+BAC", "1,2") == -1)
 							goto ioerror;
 						conn.handler = &rfcomm_handler_resp_ok;
 						break;
