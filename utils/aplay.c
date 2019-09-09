@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <alsa/asoundlib.h>
 #include <gio/gio.h>
@@ -285,6 +287,27 @@ static void pcm_worker_routine_exit(struct pcm_worker *worker) {
 	debug("Exiting PCM worker %s", worker->addr);
 }
 
+static int rockchip_send_underrun_to_deviceiolib()
+{
+	struct sockaddr_un serverAddr;
+	int sockfd;
+
+	sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if (sockfd < 0) {
+		printf("FUNC:%s create sockfd failed!\n", __func__);
+		return -1;
+	}
+
+	serverAddr.sun_family = AF_UNIX;
+	strcpy(serverAddr.sun_path, "/tmp/rk_deviceio_a2dp_underrun");
+
+	sendto(sockfd, "a2dp underrun;", strlen("a2dp underrun;"), MSG_DONTWAIT, (struct sockaddr *)&serverAddr, sizeof(serverAddr));
+	usleep(1000);
+
+	close(sockfd);
+	return 0;
+}
+
 static void *pcm_worker_routine(void *arg) {
 	struct pcm_worker *w = (struct pcm_worker *)arg;
 
@@ -445,6 +468,8 @@ static void *pcm_worker_routine(void *arg) {
 			switch (-frames) {
 			case EPIPE:
 				debug("An underrun has occurred");
+				/* Send underrun msg to rockchip deviceio */
+				rockchip_send_underrun_to_deviceiolib();
 				snd_pcm_prepare(w->pcm);
 				usleep(50000);
 				frames = 0;
