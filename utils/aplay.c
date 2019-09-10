@@ -245,7 +245,6 @@ static void pcm_worker_routine_exit(struct pcm_worker *worker) {
 static int rockchip_send_underrun_to_deviceiolib()
 {
 	struct sockaddr_un serverAddr;
-	int snd_cnt = 1;
 	int sockfd;
 
 	sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -257,10 +256,8 @@ static int rockchip_send_underrun_to_deviceiolib()
 	serverAddr.sun_family = AF_UNIX;
 	strcpy(serverAddr.sun_path, "/tmp/rk_deviceio_a2dp_underrun");
 
-	while(snd_cnt--) {
-		sendto(sockfd, "a2dp underrun;", strlen("a2dp underrun;"), MSG_DONTWAIT, (struct sockaddr *)&serverAddr, sizeof(serverAddr));
-		usleep(1000); //5ms
-	}
+	sendto(sockfd, "a2dp underrun;", strlen("a2dp underrun;"), MSG_DONTWAIT, (struct sockaddr *)&serverAddr, sizeof(serverAddr));
+	usleep(1000);
 
 	close(sockfd);
 	return 0;
