@@ -17,12 +17,10 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <sys/socket.h>
-#include <sys/un.h>
-
 #include "bluealsa.h"
 #include "ctl.h"
 #include "utils.h"
+#include "shared/defs.h"
 #include "shared/log.h"
 
 
@@ -34,9 +32,6 @@ struct at_reader {
 	/* pointer to the next message within the buffer */
 	char *next;
 };
-
-/* RockChip add this code for cooperating with rk deviceio */
-static int rockchip_send_msg_to_deviceiolib(char * buff);
 
 /**
  * Read AT message.
@@ -78,13 +73,6 @@ retry:
 		return -1;
 	}
 
-	if (strstr(at_type2str(reader->at.type), "RESP") && strstr(reader->at.value, "RING"))
-		rockchip_send_msg_to_deviceiolib("hfp_hf_ring");
-	else if (strstr(at_type2str(reader->at.type), "RESP") && strstr(reader->at.command, "+BCS"))
-		rockchip_send_msg_to_deviceiolib(msg);
-	else if (strstr(at_type2str(reader->at.type), "RESP") && strstr(reader->at.command, "+CIEV"))
-		rockchip_send_msg_to_deviceiolib(msg);
-
 	reader->next = tmp[0] != '\0' ? tmp : NULL;
 	return 0;
 }
@@ -117,33 +105,6 @@ retry:
 		return -1;
 	}
 
-	return 0;
-}
-
-static int rockchip_send_msg_to_deviceiolib(char *msg)
-{
-	struct sockaddr_un serverAddr;
-	int snd_cnt = 1;
-	int sockfd;
-	char buff[100] = {0};
-
-	sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
-	if (sockfd < 0) {
-		printf("FUNC:%s create sockfd failed!\n", __func__);
-		return -1;
-	}
-
-	serverAddr.sun_family = AF_UNIX;
-	strcpy(serverAddr.sun_path, "/tmp/rk_deviceio_rfcomm_status");
-	memset(buff, 0, sizeof(buff));
-	sprintf(buff, "rfcomm status:%s;", msg);
-
-	while(snd_cnt--) {
-		sendto(sockfd, buff, strlen(buff), MSG_DONTWAIT, (struct sockaddr *)&serverAddr, sizeof(serverAddr));
-		usleep(1000); //5ms
-	}
-
-	close(sockfd);
 	return 0;
 }
 
@@ -234,7 +195,7 @@ static int rfcomm_handler_cind_resp_get_cb(struct rfcomm_conn *c, const struct b
 	size_t i;
 
 	/* parse response for the +CIND GET command */
-	for (i = 0; i < sizeof(c->hfp_ind_map) / sizeof(*c->hfp_ind_map); i++) {
+	for (i = 0; i < ARRAYSIZE(c->hfp_ind_map); i++) {
 		t->rfcomm.hfp_inds[c->hfp_ind_map[i]] = atoi(tmp);
 		if (c->hfp_ind_map[i] == HFP_IND_BATTCHG)
 			device_set_battery_level(t->device, atoi(tmp) * 100 / 5);
@@ -576,7 +537,7 @@ static rfcomm_callback *rfcomm_get_callback(const struct bt_at *at) {
 
 	size_t i;
 
-	for (i = 0; i < sizeof(handlers) / sizeof(*handlers); i++) {
+	for (i = 0; i < ARRAYSIZE(handlers); i++) {
 		if (handlers[i]->type != at->type)
 			continue;
 		if (strcmp(handlers[i]->command, at->command) != 0)
@@ -591,7 +552,7 @@ void *rfcomm_thread(void *arg) {
 	struct ba_transport *t = (struct ba_transport *)arg;
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(transport_pthread_cleanup, t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(transport_pthread_cleanup), t);
 
 	/* initialize structure used for synchronization */
 	struct rfcomm_conn conn = {
@@ -609,7 +570,7 @@ void *rfcomm_thread(void *arg) {
 	};
 
 	debug("Starting RFCOMM loop: %s",
-			bluetooth_profile_to_string(t->profile, t->codec));
+			bluetooth_profile_to_string(t->profile));
 	for (;;) {
 
 		/* During normal operation, RFCOMM should block indefinitely. However,
@@ -657,6 +618,7 @@ void *rfcomm_thread(void *arg) {
 						conn.handler = &rfcomm_handler_resp_ok;
 						break;
 					}
+					/* fall-through */
 				case HFP_SLC_BAC_SET_OK:
 					if (rfcomm_write_at(pfds[1].fd, AT_TYPE_CMD_TEST, "+CIND", NULL) == -1)
 						goto ioerror;
@@ -682,15 +644,16 @@ void *rfcomm_thread(void *arg) {
 					break;
 				case HFP_SLC_CMER_SET_OK:
 					rfcomm_set_hfp_state(&conn, HFP_SLC_CONNECTED);
-					rockchip_send_msg_to_deviceiolib("hfp_slc_connected");
+					/* fall-through */
 				case HFP_SLC_CONNECTED:
 					if (t->rfcomm.hfp_features & HFP_AG_FEAT_CODEC)
 						break;
+					/* fall-through */
 				case HFP_CC_BCS_SET:
 				case HFP_CC_BCS_SET_OK:
 				case HFP_CC_CONNECTED:
 					rfcomm_set_hfp_state(&conn, HFP_CONNECTED);
-					rockchip_send_msg_to_deviceiolib("hfp_hf_connected");
+					/* fall-through */
 				case HFP_CONNECTED:
 					bluealsa_ctl_event(BA_EVENT_TRANSPORT_ADDED);
 				}
@@ -708,6 +671,7 @@ void *rfcomm_thread(void *arg) {
 					break;
 				case HFP_SLC_CMER_SET_OK:
 					rfcomm_set_hfp_state(&conn, HFP_SLC_CONNECTED);
+					/* fall-through */
 				case HFP_SLC_CONNECTED:
 					if (t->rfcomm.hfp_features & HFP_HF_FEAT_CODEC) {
 						if (rfcomm_write_at(pfds[1].fd, AT_TYPE_RESP, "+BCS", "1") == -1)
@@ -716,10 +680,12 @@ void *rfcomm_thread(void *arg) {
 						conn.handler = &rfcomm_handler_bcs_set;
 						break;
 					}
+					/* fall-through */
 				case HFP_CC_BCS_SET:
 				case HFP_CC_BCS_SET_OK:
 				case HFP_CC_CONNECTED:
 					rfcomm_set_hfp_state(&conn, HFP_CONNECTED);
+					/* fall-through */
 				case HFP_CONNECTED:
 					bluealsa_ctl_event(BA_EVENT_TRANSPORT_ADDED);
 				}
@@ -737,11 +703,13 @@ void *rfcomm_thread(void *arg) {
 
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 
-		switch (poll(pfds, sizeof(pfds) / sizeof(*pfds), timeout)) {
+		switch (poll(pfds, ARRAYSIZE(pfds), timeout)) {
 		case 0:
 			debug("RFCOMM poll timeout");
 			continue;
 		case -1:
+			if (errno == EINTR)
+				continue;
 			error("RFCOMM poll error: %s", strerror(errno));
 			goto fail;
 		}
@@ -840,7 +808,6 @@ ioerror:
 		case ETIMEDOUT:
 			/* exit the thread upon socket disconnection */
 			debug("RFCOMM disconnected: %s", strerror(errno));
-			rockchip_send_msg_to_deviceiolib("hfp_slc_disconnected");
 			goto fail;
 		default:
 			error("RFCOMM IO error: %s", strerror(errno));
