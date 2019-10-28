@@ -240,9 +240,11 @@ static int rfcomm_handler_ciev_resp_cb(struct rfcomm_conn *c, const struct bt_at
 			if (value == 1)
 				transport_send_signal(t->rfcomm.sco,
 						      TRANSPORT_PCM_OPEN);
-			else if (value == 0)
-				transport_send_signal(t->rfcomm.sco,
-						      TRANSPORT_PCM_CLOSE);
+			/* Don't trigger SCO thread to disconnect SCO link */
+			/* else if (value == 0)
+			 * 	transport_send_signal(t->rfcomm.sco,
+			 * 			      TRANSPORT_PCM_CLOSE);
+			 */
 			break;
 		case HFP_IND_CALLSETUP:
 			break;
