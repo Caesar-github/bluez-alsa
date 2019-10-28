@@ -199,6 +199,8 @@ struct ba_transport {
 			struct ba_pcm spk_pcm;
 			struct ba_pcm mic_pcm;
 
+			int listen_fd;
+
 		} sco;
 
 	};
@@ -266,6 +268,7 @@ int transport_release_bt_a2dp(struct ba_transport *t);
 int transport_release_bt_rfcomm(struct ba_transport *t);
 
 int transport_acquire_bt_sco(struct ba_transport *t);
+int transport_acquire_bt_sco2(struct ba_transport *t, int asock);
 int transport_release_bt_sco(struct ba_transport *t);
 
 int transport_release_pcm(struct ba_pcm *pcm);

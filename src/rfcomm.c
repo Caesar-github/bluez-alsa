@@ -237,8 +237,14 @@ static int rfcomm_handler_ciev_resp_cb(struct rfcomm_conn *c, const struct bt_at
 		t->rfcomm.hfp_inds[c->hfp_ind_map[index - 1]] = value;
 		switch (c->hfp_ind_map[index - 1]) {
 		case HFP_IND_CALL:
+			if (value == 1)
+				transport_send_signal(t->rfcomm.sco,
+						      TRANSPORT_PCM_OPEN);
+			else if (value == 0)
+				transport_send_signal(t->rfcomm.sco,
+						      TRANSPORT_PCM_CLOSE);
+			break;
 		case HFP_IND_CALLSETUP:
-			transport_send_signal(t->rfcomm.sco, TRANSPORT_PCM_OPEN);
 			break;
 		case HFP_IND_BATTCHG:
 			device_set_battery_level(t->device, value * 100 / 5);
@@ -369,8 +375,26 @@ static int rfcomm_handler_bcs_set_cb(struct rfcomm_conn *c, const struct bt_at *
 }
 
 static int rfcomm_handler_resp_bcs_ok_cb(struct rfcomm_conn *c, const struct bt_at *at) {
+	struct ba_transport * const t = c->t;
+	struct ba_transport *t_sco;
+	struct bt_voice voice = {
+		.setting = BT_VOICE_CVSD_16BIT,
+	};
+
 	if (rfcomm_handler_resp_ok_cb(c, at) != 0)
 		return -1;
+
+	/* Change voice setting according to codec */
+	if (t->rfcomm.sco->codec == HFP_CODEC_MSBC)
+		voice.setting = BT_VOICE_TRANSPARENT;
+	t_sco = t->rfcomm.sco;
+	if (setsockopt(t_sco->sco.listen_fd, SOL_BLUETOOTH, BT_VOICE,
+		       &voice, sizeof(voice)) == -1) {
+		error("setsockopt BT_VOICE error %d, %s", errno,
+		      strerror(errno));
+		return 0;
+	}
+
 	/* When codec selection is completed, notify connected clients, that
 	 * transport has been changed. Note, that this event might be emitted
 	 * for an active transport - codec switching. */
@@ -613,6 +637,7 @@ void *rfcomm_thread(void *arg) {
 					break;
 				case HFP_SLC_BRSF_SET_OK:
 					if (t->rfcomm.hfp_features & HFP_AG_FEAT_CODEC) {
+						/* XXX: If mSBC is supported, please change 1 to 1,2 */
 						if (rfcomm_write_at(pfds[1].fd, AT_TYPE_CMD_SET, "+BAC", "1") == -1)
 							goto ioerror;
 						conn.handler = &rfcomm_handler_resp_ok;

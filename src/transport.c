@@ -1006,6 +1006,35 @@ int transport_acquire_bt_sco(struct ba_transport *t) {
 	return t->bt_fd;
 }
 
+int transport_acquire_bt_sco2(struct ba_transport *t, int asock)
+{
+
+	struct hci_dev_info di;
+
+	if (t->bt_fd != -1)
+		return t->bt_fd;
+
+	t->bt_fd = asock;
+
+	if (hci_devinfo(t->device->hci_dev_id, &di) == -1) {
+		error("Couldn't get HCI device info: %s", strerror(errno));
+		return -1;
+	}
+
+	t->mtu_read = di.sco_mtu;
+	t->mtu_write = di.sco_mtu;
+	t->release = transport_release_bt_sco;
+
+	/* XXX: It seems, that the MTU values returned by the HCI interface
+	 *      are incorrect (or our interpretation of them is incorrect). */
+	t->mtu_read = 48;
+	t->mtu_write = 48;
+
+	debug("New SCO link: %d (MTU: R:%zu W:%zu)", t->bt_fd, t->mtu_read, t->mtu_write);
+
+	return t->bt_fd;
+}
+
 int transport_release_bt_sco(struct ba_transport *t) {
 
 	if (t->bt_fd == -1)

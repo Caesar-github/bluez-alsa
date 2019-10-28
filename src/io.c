@@ -23,6 +23,11 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/timerfd.h>
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/hci.h>
+#include <bluetooth/hci_lib.h>
+#include <bluetooth/sco.h>
 
 #include <sbc/sbc.h>
 #if ENABLE_AAC
@@ -1509,8 +1514,62 @@ fail_open_ldac:
 }
 #endif
 
+static void close_lsocket(struct ba_transport *t)
+{
+	if (t->sco.listen_fd > 0) {
+		close(t->sco.listen_fd);
+		t->sco.listen_fd = -1;
+	}
+}
+
+static int bind_sco(struct ba_transport *t, int sock)
+{
+	struct sockaddr_sco addr;
+	struct hci_dev_info di;
+
+	if (hci_devinfo(t->device->hci_dev_id, &di) == -1) {
+		error("Couldn't get HCI device info: %s", strerror(errno));
+		return -1;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sco_family = AF_BLUETOOTH;
+	bacpy(&addr.sco_bdaddr, &di.bdaddr);
+
+	if (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+		error("Couldn't bind sco socket");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int timeout_set(int fd, unsigned int msec)
+{
+	struct itimerspec itimer;
+	unsigned int sec = msec / 1000;
+
+	memset(&itimer, 0, sizeof(itimer));
+	itimer.it_interval.tv_sec = 0;
+	itimer.it_interval.tv_nsec = 0;
+	itimer.it_value.tv_sec = sec;
+	itimer.it_value.tv_nsec = (msec - (sec * 1000)) * 1000 * 1000;
+
+	return timerfd_settime(fd, 0, &itimer, NULL);
+}
+
+static void close_timerfd(void *data)
+{
+	int fd = (int)data;
+
+	close(fd);
+}
+
 void *io_thread_sco(void *arg) {
 	struct ba_transport *t = (struct ba_transport *)arg;
+	int defer = 1;
+	int sco_timer;
+	int timer_added = 0;
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_push(PTHREAD_CLEANUP(transport_pthread_cleanup), t);
@@ -1528,6 +1587,33 @@ void *io_thread_sco(void *arg) {
 		goto fail_ffb;
 	}
 
+	t->sco.listen_fd = socket(PF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_SCO);
+	if (t->sco.listen_fd == -1) {
+		error("Couldn't open sco socket: %s", strerror(errno));
+		goto fail_ffb;
+	}
+	pthread_cleanup_push(PTHREAD_CLEANUP(close_lsocket), t);
+	if (bind_sco(t, t->sco.listen_fd) < 0) {
+		error("Couldn't bind sco socket");
+		goto fail_sock;
+	}
+	if (setsockopt(t->sco.listen_fd, SOL_BLUETOOTH, BT_DEFER_SETUP,
+		       &defer, sizeof(defer)) < 0) {
+		error("Couldn't set defer for sco");
+		/* Ignore this error */
+	}
+	if (listen(t->sco.listen_fd, 1) < 0) {
+		error("Couldn't listen %s", strerror(errno));
+		goto fail_sock;
+	}
+
+	sco_timer = timerfd_create(CLOCK_REALTIME, 0);
+	if (sco_timer == -1) {
+		error("Couldn't create sco timer %s", strerror(errno));
+		goto fail_sock;
+	}
+	pthread_cleanup_push(PTHREAD_CLEANUP(close_timerfd), (void *)sco_timer);
+
 	int poll_timeout = -1;
 	struct asrsync asrs = { .frames = 0 };
 	struct pollfd pfds[] = {
@@ -1538,6 +1624,8 @@ void *io_thread_sco(void *arg) {
 		/* PCM FIFO */
 		{ -1, POLLIN, 0 },
 		{ -1, POLLOUT, 0 },
+		{ t->sco.listen_fd, POLLIN, 0 },
+		{ sco_timer, POLLIN, 0 }, /* [6] for sco timer */
 	};
 
 	debug("Starting IO loop: %s",
@@ -1595,28 +1683,27 @@ void *io_thread_sco(void *arg) {
 			if (sig == TRANSPORT_PCM_SYNC)
 				pthread_cond_signal(&t->sco.spk_pcm.drained);
 
+			/* Received TRANSPORT_PCM_OPEN from client or rfcomm
+			 * thread (callsetup=0/1, call=1).
+			 * So at least three open events will be received when
+			 * answer a call
+			 */
 			const enum hfp_ind *inds = t->sco.rfcomm->rfcomm.hfp_inds;
-			bool release = false;
+			if (sig == TRANSPORT_PCM_OPEN) {
+				info("Received transport pcm open event");
+				/* Start a timer to wait for sco connection from
+				 * AG. If timer is expired, connect to AG
+				 */
+				if (t->profile == BLUETOOTH_PROFILE_HFP_HF &&
+				    inds[HFP_IND_CALL] == HFP_IND_CALL_ACTIVE)
+					timeout_set(sco_timer, 3000);
+			}
 
-			/* It is required to release SCO if we are not transferring audio,
-			 * because it will free Bluetooth bandwidth - microphone signal is
-			 * transfered even though we are not reading from it! */
-			if (t->sco.spk_pcm.fd == -1 && t->sco.mic_pcm.fd == -1)
-				release = true;
-			/* For HFP HF we have to check if we are in the call stage or in the
-			 * call setup stage. Otherwise, it might be not possible to acquire
-			 * SCO connection. */
-			if (t->profile == BLUETOOTH_PROFILE_HFP_HF &&
-					inds[HFP_IND_CALL] == HFP_IND_CALL_NONE &&
-					inds[HFP_IND_CALLSETUP] == HFP_IND_CALLSETUP_NONE)
-				release = true;
-
-			if (release) {
+			if (sig == TRANSPORT_PCM_CLOSE) {
+				info("Received transport pcm close event");
 				transport_release_bt_sco(t);
 				asrs.frames = 0;
 			}
-			else
-				transport_acquire_bt_sco(t);
 
 			continue;
 		}
@@ -1624,6 +1711,7 @@ void *io_thread_sco(void *arg) {
 		if (asrs.frames == 0)
 			asrsync_init(&asrs, transport_get_sampling(t));
 
+		/* t->bt_fd */
 		if (pfds[1].revents & POLLIN) {
 			/* dispatch incoming SCO data */
 
@@ -1666,6 +1754,7 @@ retry_sco_read:
 			transport_release_bt_sco(t);
 		}
 
+		/* t->bt_fd */
 		if (pfds[2].revents & POLLOUT) {
 			/* write-out SCO data */
 
@@ -1704,6 +1793,7 @@ retry_sco_write:
 
 		}
 
+		/* t->sco.spk_pcm.fd */
 		if (pfds[3].revents & POLLIN) {
 			/* dispatch incoming PCM data */
 
@@ -1740,6 +1830,7 @@ retry_sco_write:
 			t->sco.spk_pcm.fd = -1;
 		}
 
+		/* t->sco.mic_pcm.fd */
 		if (pfds[4].revents & POLLOUT) {
 			/* write-out PCM data */
 
@@ -1767,6 +1858,70 @@ retry_sco_write:
 
 		}
 
+		/* sco_timer */
+		if (pfds[6].revents & POLLIN) {
+			bool release = false;
+			const enum hfp_ind *inds = t->sco.rfcomm->rfcomm.hfp_inds;
+
+			info("SCO timer expired");
+
+			if (t->bt_fd != -1) {
+				warn("Timer expired but sco link was created");
+				continue;
+			}
+
+			/* TODO: Should  we need to check client */
+			/* if (t->sco.spk_pcm.fd == -1 && t->sco.mic_pcm.fd == -1)
+			 * 	release = true;
+			 */
+
+			if (t->profile == BLUETOOTH_PROFILE_HFP_HF &&
+			    inds[HFP_IND_CALL] == HFP_IND_CALL_NONE &&
+			    inds[HFP_IND_CALLSETUP] == HFP_IND_CALLSETUP_NONE)
+				release = true;
+			if (release) {
+				transport_release_bt_sco(t);
+				asrs.frames = 0;
+			} else {
+				transport_acquire_bt_sco(t);
+			}
+			continue;
+		}
+
+		/* t->sco.listen_fd */
+		if (pfds[5].revents & POLLIN) {
+			int sock;
+			struct sockaddr_sco addr;
+			socklen_t len = sizeof(addr);
+			const enum hfp_ind *inds = t->sco.rfcomm->rfcomm.hfp_inds;
+			bool release = false;
+
+			info("SCO connection created by peer");
+			sock = accept(pfds[5].fd, (struct sockaddr *)&addr,
+				      &len);
+			if (sock < 0) {
+				error("Couldn't accept sco connection");
+				continue;
+			}
+			/* For HFP HF we have to check if we are in the call
+			 * stage or in the call setup stage. Otherwise, it might
+			 * be not possible to acquire SCO connection. */
+			if (t->profile == BLUETOOTH_PROFILE_HFP_HF &&
+			    inds[HFP_IND_CALL] == HFP_IND_CALL_NONE &&
+			    inds[HFP_IND_CALLSETUP] == HFP_IND_CALLSETUP_NONE)
+				release = true;
+
+			if (release) {
+				transport_release_bt_sco(t);
+				asrs.frames = 0;
+			} else {
+				transport_acquire_bt_sco2(t, sock);
+				/* Kill timer that is used to create sco link */
+				timeout_set(sco_timer, 0);
+			}
+			continue;
+		}
+
 		/* keep data transfer at a constant bit rate */
 		asrsync_sync(&asrs, 48 / 2);
 		/* update busy delay (encoding overhead) */
@@ -1776,6 +1931,9 @@ retry_sco_write:
 
 fail:
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	pthread_cleanup_pop(1); /* for sco timer */
+fail_sock:
+	pthread_cleanup_pop(1); /* for sco listen sock */
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
